@@ -4,6 +4,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Union
 
+import cv2
+
 import numpy as np
 import pycolmap
 from tqdm import tqdm
@@ -12,6 +14,8 @@ from . import logger
 from .utils.io import get_keypoints, get_matches
 from .utils.parsers import parse_image_lists, parse_retrieval
 
+from kapture import PoseTransform
+import quaternion
 
 def do_covisibility_clustering(
     frame_ids: List[int], reconstruction: pycolmap.Reconstruction
@@ -54,12 +58,98 @@ class QueryLocalizer:
     def __init__(self, reconstruction, config=None):
         self.reconstruction = reconstruction
         self.config = config or {}
+        self.kf = cv2.KalmanFilter(6, 3)
+        self.first = True
+        self.warmup = 5000
+        self.curr_iter = 0
+        self._init_kalman_filter()
 
-    def localize(self, points2D_all, points2D_idxs, points3D_id, query_camera):
-        points2D = points2D_all[points2D_idxs]
-        points3D = [self.reconstruction.points3D[j].xyz for j in points3D_id]
-        if len(points3D) < 6:
-            print(len(points3D))
+        self.log_file = open("/mnt/ssd2/victor/hloc_out/aqtr/slice7/run_5/cam0/aux_log.txt", "w")
+        
+        self.pred_file = open("/mnt/ssd2/victor/hloc_out/aqtr/slice7/run_5/cam0/pred_log.txt", "w")
+        self.est_file = open("/mnt/ssd2/victor/hloc_out/aqtr/slice7/run_5/cam0/est_log.txt", "w")
+        self.col_file = open("/mnt/ssd2/victor/hloc_out/aqtr/slice7/run_5/cam0/col_log.txt", "w")
+
+        self.est_list = []
+        self.pred_list = []
+
+        self.aux_list = []
+
+        self.cnt = 1
+
+        self.last_pose = None
+        self.errors_list = []
+
+        self.min_points = 5000
+
+
+    def _init_kalman_filter(self):
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ], dtype=np.float32)
+        
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 0, 1, 0, 0],
+            [0, 1, 0, 0, 1, 0],
+            [0, 0, 1, 0, 0, 1],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ], dtype=np.float32)
+        
+
+        self.kf.processNoiseCov = np.eye(6, dtype=np.float32) 
+        # I4 = np.eye(3, dtype=np.float32) / 4
+        # I2 = np.eye(3, dtype=np.float32) / 2
+        # I1 = np.eye(3, dtype=np.float32)
+
+        # self.kf.processNoiseCov[:3, :3] = I4
+        # self.kf.processNoiseCov[3:, 3:] = I1
+        # self.kf.processNoiseCov[3:, :3] = I2
+        # self.kf.processNoiseCov[:3, 3:] = I2
+
+        self.kf.processNoiseCov *= 2 # 0.4
+        self.kf.measurementNoiseCov = np.eye(3, dtype=np.float32) * 0.0001
+
+        self.kf.measurementNoiseCov[0,0] = 0.44
+        self.kf.measurementNoiseCov[1,1] = 0.19
+        self.kf.measurementNoiseCov[2,2] = 1.0
+
+        
+        self.kf.statePre = np.array([0, 0, 0, 0, 0, 0], dtype=np.float32) # Just an assumption. We do not know exactly the starting point...
+        self.kf.statePost = np.array([0, 0, 0, 0, 0, 0], dtype=np.float32) # Just an assumption. We do not know exactly the first measurement values...
+        
+        self.kf.errorCovPost = np.eye(6, dtype=np.float32) * 100.0 # 1.0
+        self.kf.errorCovPre = np.eye(6, dtype=np.float32) * 100.0 # 1.0
+
+    
+    def _compute_error_last_pose(self, pose_est):
+        if self.last_pose is None:
+            return 0
+        return np.linalg.norm(pose_est.inverse().t - self.last_pose.inverse().t)
+
+
+    def estimate(self, points2D, points3D, query_camera):
+        if len(points2D) < self.min_points:
+            self.min_points = len(points2D)
+            # print(f"Min points: {self.min_points}")
+
+        if len(points2D) < 15 and not self.first:
+            print(f"Few points at: {self.cnt}")
+            # print(quaternion.as_float_array(self.last_pose.r))
+            pose_est = self.kf.predict()
+            ret = {
+                "num_inliers": 0,
+                "inliers": 0,
+                "cam_from_world": pycolmap.Rigid3d(
+                    rotation=quaternion.as_float_array(self.last_pose.r), # rotation of last pose as 'placeholder'
+                    translation=np.array(pose_est[:3]),
+                ),
+            }
+            return ret
+
         ret = pycolmap.absolute_pose_estimation(
             points2D,
             points3D,
@@ -67,8 +157,70 @@ class QueryLocalizer:
             estimation_options=self.config.get("estimation", {}),
             refinement_options=self.config.get("refinement", {}),
         )
+
+        if self.first:
+            # if it is the first image initialize the Kalman Filter with the first pose and return the Colmap pose
+            self.first = False
+            self.kf.statePre[:3] = ret["cam_from_world"].translation
+            self.kf.statePost[:3] = ret["cam_from_world"].translation
+            self.last_pose = PoseTransform(t=ret["cam_from_world"].translation, r=ret["cam_from_world"].rotation.quat)
+            return ret
+        
+        # print(f"Current pose: {ret['cam_from_world'].rotation}")
+        error_last_pose = self._compute_error_last_pose(PoseTransform(t=ret["cam_from_world"].translation, r=ret["cam_from_world"].rotation.quat))
+
+        self.errors_list.append(error_last_pose)
+
+        self.last_pose = PoseTransform(t=ret["cam_from_world"].translation, r=ret["cam_from_world"].rotation.quat)
+
+        prediction = np.zeros((3, 1), dtype=np.float32)
+        
+        t, r = np.zeros((3, 1)), np.zeros((3, 1))
+
+        # if error_last_pose > 10: # This should be in meters?
+        #     # If the error is too big, we do not update the Kalman Filter and go with the Kalman Filter prediction
+        #     prediction = self.kf.predict()
+        #     t, r = ret["cam_from_world"].translation, ret["cam_from_world"].rotation
+        #     pose_est = prediction[:3]
+        # else:
+        t = ret["cam_from_world"].translation
+        r = ret["cam_from_world"].rotation
+
+        prediction = self.kf.predict()
+        estimated = self.kf.correct(np.array(t, dtype=np.float32))
+        
+        pose_est = np.reshape(estimated[:3], t.shape)
+       
+        self.pred_file.write(f"{prediction[0]} {prediction[1]} {prediction[2]}\n")
+        self.est_file.write(f"{pose_est[0]} {pose_est[1]} {pose_est[2]}\n")
+        self.col_file.write(f"{t[0]} {t[1]} {t[2]}\n")
+        
+        if self.curr_iter < self.warmup:
+            # if it is not the first image but we are still in the warmup phase, just return the Colmap pose
+            self.curr_iter += 1
+            self.cnt += 1
+            return ret
+        
+
+        ret = {
+            "num_inliers": ret["num_inliers"],
+            "inliers": ret["inliers"],
+            "cam_from_world": pycolmap.Rigid3d(
+                rotation=r,
+                translation=np.array(pose_est),
+            ),
+        }
+        self.cnt += 1
         return ret
 
+
+    def localize(self, points2D_all, points2D_idxs, points3D_id, query_camera):
+        points2D = points2D_all[points2D_idxs]
+        points3D = [self.reconstruction.points3D[j].xyz for j in points3D_id]
+
+        ret = self.estimate(points2D, points3D, query_camera)
+        return ret
+    
 
 def pose_from_cluster(
     localizer: QueryLocalizer,
@@ -161,6 +313,7 @@ def main(
         "retrieval": retrieval,
         "loc": {},
     }
+
     logger.info("Starting localization...")
     for qname, qcam in tqdm(queries):
         if qname not in retrieval_dict:
@@ -208,6 +361,9 @@ def main(
             log["covisibility_clustering"] = covisibility_clustering
             logs["loc"][qname] = log
 
+    # for i, e in enumerate(localizer.errors_list):
+    #     print(f"{i+1} --- {e}")
+    
     logger.info(f"Localized {len(cam_from_world)} / {len(queries)} images.")
     logger.info(f"Writing poses to {results}...")
     with open(results, "w") as f:
