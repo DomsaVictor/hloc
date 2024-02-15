@@ -60,7 +60,7 @@ class QueryLocalizer:
         self.config = config or {}
         self.kf = cv2.KalmanFilter(6, 3)
         self.first = True
-        self.warmup = 5000
+        self.warmup = 0
         self.curr_iter = 0
         self._init_kalman_filter()
 
@@ -98,7 +98,6 @@ class QueryLocalizer:
             [0, 0, 0, 0, 1, 0],
             [0, 0, 0, 0, 0, 1]
         ], dtype=np.float32)
-        
 
         self.kf.processNoiseCov = np.eye(6, dtype=np.float32) 
         # I4 = np.eye(3, dtype=np.float32) / 4
